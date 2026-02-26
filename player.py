@@ -3,12 +3,16 @@ import random
 import re
 import torch
 from typing import Optional
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from chess_tournament.players import Player
 
 
 class TransformerPlayer(Player):
+    """
+    Transformer-based chess player.
+    Safe for championship execution.
+    """
 
     UCI_REGEX = re.compile(r"\b([a-h][1-8][a-h][1-8][qrbn]?)\b", re.IGNORECASE)
 
@@ -27,15 +31,45 @@ class TransformerPlayer(Player):
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_id)
-        self.model.to(self.device)
-        self.model.eval()
+        # Lazy-loaded
+        self.tokenizer = None
+        self.model = None
 
+    # -------------------------
+    # Lazy model loading
+    # -------------------------
+    def _load_model(self):
+        if self.model is None:
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+                self.model = AutoModelForCausalLM.from_pretrained(self.model_id)
+
+                self.model.to(self.device)
+                self.model.eval()
+
+            except Exception:
+                # If loading fails, keep model None
+                self.model = None
+                self.tokenizer = None
+
+    # -------------------------
+    # Extract UCI move
+    # -------------------------
     def _extract_move(self, text: str) -> Optional[str]:
         match = self.UCI_REGEX.search(text)
         return match.group(1).lower() if match else None
 
+    # -------------------------
+    # Random fallback
+    # -------------------------
+    def _random_legal(self, fen: str) -> Optional[str]:
+        board = chess.Board(fen)
+        legal_moves = list(board.legal_moves)
+        return random.choice(legal_moves).uci() if legal_moves else None
+
+    # -------------------------
+    # Main API
+    # -------------------------
     def get_move(self, fen: str) -> Optional[str]:
 
         board = chess.Board(fen)
@@ -43,6 +77,13 @@ class TransformerPlayer(Player):
 
         if not legal_moves:
             return None
+
+        # Try loading model if not loaded
+        self._load_model()
+
+        # If model failed to load → fallback immediately
+        if self.model is None or self.tokenizer is None:
+            return random.choice(legal_moves)
 
         prompt = f"FEN: {fen}\nMove:"
 
@@ -68,5 +109,5 @@ class TransformerPlayer(Player):
         except Exception:
             pass
 
-        # fallback
+        # Safe fallback
         return random.choice(legal_moves)
