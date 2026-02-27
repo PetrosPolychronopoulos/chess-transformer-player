@@ -9,10 +9,6 @@ from chess_tournament.players import Player
 
 
 class TransformerPlayer(Player):
-    """
-    Transformer-based chess player.
-    Safe for championship execution.
-    """
 
     UCI_REGEX = re.compile(r"\b([a-h][1-8][a-h][1-8][qrbn]?)\b", re.IGNORECASE)
 
@@ -20,8 +16,8 @@ class TransformerPlayer(Player):
         self,
         name: str = "Student",
         model_id: str = "1efd/chess-transformer",
-        temperature: float = 0.7,
-        max_new_tokens: int = 8,
+        temperature: float = 0.9,      # more aggro
+        max_new_tokens: int = 6,
     ):
         super().__init__(name)
 
@@ -31,7 +27,6 @@ class TransformerPlayer(Player):
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Lazy-loaded
         self.tokenizer = None
         self.model = None
 
@@ -43,12 +38,9 @@ class TransformerPlayer(Player):
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
                 self.model = AutoModelForCausalLM.from_pretrained(self.model_id)
-
                 self.model.to(self.device)
                 self.model.eval()
-
             except Exception:
-                # If loading fails, keep model None
                 self.model = None
                 self.tokenizer = None
 
@@ -58,14 +50,6 @@ class TransformerPlayer(Player):
     def _extract_move(self, text: str) -> Optional[str]:
         match = self.UCI_REGEX.search(text)
         return match.group(1).lower() if match else None
-
-    # -------------------------
-    # Random fallback
-    # -------------------------
-    def _random_legal(self, fen: str) -> Optional[str]:
-        board = chess.Board(fen)
-        legal_moves = list(board.legal_moves)
-        return random.choice(legal_moves).uci() if legal_moves else None
 
     # -------------------------
     # Main API
@@ -78,14 +62,17 @@ class TransformerPlayer(Player):
         if not legal_moves:
             return None
 
-        # Try loading model if not loaded
         self._load_model()
 
-        # If model failed to load → fallback immediately
+        # Fallback if model unavailable
         if self.model is None or self.tokenizer is None:
             return random.choice(legal_moves)
-
-        prompt = f"FEN: {fen}\nMove:"
+        prompt = (
+            "You are a chess engine.\n"
+            "Given this position in FEN format:\n"
+            f"{fen}\n"
+            "Output ONLY the best legal move in UCI format.\n"
+        )
 
         try:
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
@@ -96,11 +83,11 @@ class TransformerPlayer(Player):
                     max_new_tokens=self.max_new_tokens,
                     do_sample=True,
                     temperature=self.temperature,
+                    top_p=0.95,
                     pad_token_id=self.tokenizer.eos_token_id,
                 )
 
             decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
             move = self._extract_move(decoded)
 
             if move and move in legal_moves:
@@ -108,6 +95,13 @@ class TransformerPlayer(Player):
 
         except Exception:
             pass
+
+        capture_moves = [
+            m.uci() for m in board.legal_moves if board.is_capture(m)
+        ]
+
+        if capture_moves:
+            return random.choice(capture_moves)
 
         # Safe fallback
         return random.choice(legal_moves)
