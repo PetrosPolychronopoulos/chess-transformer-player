@@ -1,6 +1,4 @@
 import chess
-import random
-import re
 import torch
 from typing import Optional
 
@@ -10,28 +8,21 @@ from chess_tournament.players import Player
 
 class TransformerPlayer(Player):
 
-    UCI_REGEX = re.compile(r"\b([a-h][1-8][a-h][1-8][qrbn]?)\b", re.IGNORECASE)
-
     def __init__(
         self,
         name: str = "Student",
         model_id: str = "1efd/chess-transformer",
-        temperature: float = 0.9,      # more aggro
-        max_new_tokens: int = 6,
     ):
         super().__init__(name)
 
         self.model_id = model_id
-        self.temperature = temperature
-        self.max_new_tokens = max_new_tokens
-
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.tokenizer = None
         self.model = None
 
     # -------------------------
-    # Lazy model loading
+    # Safe lazy loading
     # -------------------------
     def _load_model(self):
         if self.model is None:
@@ -40,16 +31,8 @@ class TransformerPlayer(Player):
                 self.model = AutoModelForCausalLM.from_pretrained(self.model_id)
                 self.model.to(self.device)
                 self.model.eval()
-            except Exception:
-                self.model = None
-                self.tokenizer = None
-
-    # -------------------------
-    # Extract UCI move
-    # -------------------------
-    def _extract_move(self, text: str) -> Optional[str]:
-        match = self.UCI_REGEX.search(text)
-        return match.group(1).lower() if match else None
+            except Exception as e:
+                raise RuntimeError(f"Model loading failed: {e}")
 
     # -------------------------
     # Main API
@@ -57,46 +40,52 @@ class TransformerPlayer(Player):
     def get_move(self, fen: str) -> Optional[str]:
 
         board = chess.Board(fen)
-        legal_moves = [m.uci() for m in board.legal_moves]
+        legal_moves = list(board.legal_moves)
 
+        # Game over
         if not legal_moves:
             return None
 
+        # Load model (only once)
         self._load_model()
 
-        # Fallback if model unavailable
-        if self.model is None or self.tokenizer is None:
-            return random.choice(legal_moves)
         prompt = f"FEN: {fen}\nMove:"
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
 
         try:
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-
             with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=self.max_new_tokens,
-                    do_sample=True,
-                    temperature=self.temperature,
-                    top_p=0.95,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                )
+                outputs = self.model(**inputs)
 
-            decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            move = self._extract_move(decoded)
+            logits = outputs.logits[0, -1]
 
-            if move and move in legal_moves:
-                return move
+            best_move = None
+            best_score = float("-inf")
 
-        except Exception:
-            pass
+            for move in legal_moves:
+                uci = move.uci()
 
-        capture_moves = [
-            m.uci() for m in board.legal_moves if board.is_capture(m)
-        ]
+                tokens = self.tokenizer(
+                    " " + uci,
+                    add_special_tokens=False
+                )["input_ids"]
 
-        if capture_moves:
-            return random.choice(capture_moves)
+                if not tokens:
+                    continue
 
-        # Safe fallback
-        return random.choice(legal_moves)
+                token_id = tokens[0]
+                score = logits[token_id].item()
+
+                if score > best_score:
+                    best_score = score
+                    best_move = uci
+
+            # Guaranteed legal (selected from legal_moves)
+            if best_move is not None:
+                return best_move
+
+        except Exception as e:
+            raise RuntimeError(f"Inference failed: {e}")
+
+        # This should never happen, but for absolute safety:
+        # return first legal move (still deterministic, not random)
+        return legal_moves[0].uci()
