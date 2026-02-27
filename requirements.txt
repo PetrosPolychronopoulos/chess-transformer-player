@@ -1,4 +1,4 @@
 torch
 transformers
-chess
+python-chess
 huggingface_hub
