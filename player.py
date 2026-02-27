@@ -67,12 +67,7 @@ class TransformerPlayer(Player):
         # Fallback if model unavailable
         if self.model is None or self.tokenizer is None:
             return random.choice(legal_moves)
-        prompt = (
-            "You are a chess engine.\n"
-            "Given this position in FEN format:\n"
-            f"{fen}\n"
-            "Output ONLY the best legal move in UCI format.\n"
-        )
+        prompt = f"FEN: {fen}\nMove:"
 
         try:
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
