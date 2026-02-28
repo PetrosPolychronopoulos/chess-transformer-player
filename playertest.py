@@ -25,7 +25,7 @@ class TransformerPlayer(Player):
     def __init__(
         self,
         name: str = "Student",
-        model_id: str = "distilgpt2",
+        model_id: str = "sshleifer/tiny-gpt2",
     ):
         super().__init__(name)
 
