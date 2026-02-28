@@ -85,10 +85,21 @@ class TransformerPlayer(Player):
 
         for move in legal_moves:
             board.push(move)
+
             new_material = self._material_score(board)
+            material_gain = new_material - current_material
+
+            mobility_bonus = 0.05 * len(list(board.legal_moves))
+
+            check_bonus = 0.7 if board.is_check() else 0
+
             board.pop()
 
-            move_scores.append((move, new_material - current_material))
+            capture_bonus = 0.3 if board.is_capture(move) else 0
+
+            score = material_gain + capture_bonus + check_bonus + mobility_bonus
+
+            move_scores.append((move, score))
 
         # Step 2: select best material gain
         best_gain = max(score for _, score in move_scores)
