@@ -8,14 +8,15 @@ from chess_tournament.players import Player
 
 class TransformerPlayer(Player):
     """
-    Deterministic transformer-based chess player.
-    Uses legal-move log-probability ranking.
+    Fast deterministic transformer-based chess player.
+    Uses next-token log-probability ranking over legal moves.
+    Optimized for CPU.
     """
 
     def __init__(
         self,
         name: str = "Student",
-        model_id: str = "distilgpt2",
+        model_id: str = "distilgpt2",   # general LM (NOT chess-specific)
     ):
         super().__init__(name)
 
@@ -48,80 +49,49 @@ class TransformerPlayer(Player):
         return f"Position: {fen}\nBest move:"
 
     # -------------------------
-    # Log-prob scoring
-    # -------------------------
-    def _score_move(self, prompt: str, move_uci: str) -> float:
-        full_text = prompt + move_uci
-
-        inputs = self.tokenizer(full_text, return_tensors="pt").to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-
-        logits = outputs.logits
-        shift_logits = logits[:, :-1, :]
-        shift_labels = inputs["input_ids"][:, 1:]
-
-        log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
-
-        move_tokens = self.tokenizer(move_uci, return_tensors="pt")["input_ids"][0]
-        move_len = move_tokens.size(0)
-
-        total_log_prob = 0.0
-
-        for i in range(move_len):
-            token_id = shift_labels[0, -move_len + i]
-            total_log_prob += log_probs[0, -move_len + i, token_id].item()
-
-        return total_log_prob
-
-    # -------------------------
-    # Candidate filtering
-    # -------------------------
-    def _select_candidates(self, board: chess.Board):
-        legal_moves = list(board.legal_moves)
-
-        captures = [m for m in legal_moves if board.is_capture(m)]
-        checks = [m for m in legal_moves if board.gives_check(m)]
-
-        candidates = captures + checks
-
-        if len(candidates) < 8:
-            others = [m for m in legal_moves if m not in candidates]
-            candidates += others[: 8 - len(candidates)]
-
-        if not candidates:
-            candidates = legal_moves
-
-        return candidates
-
-    # -------------------------
     # Main API
     # -------------------------
     def get_move(self, fen: str) -> Optional[str]:
+
         try:
             self._load_model()
         except Exception:
             return None
 
         board = chess.Board(fen)
-        candidates = self._select_candidates(board)
+        legal_moves = list(board.legal_moves)
 
-        if not candidates:
+        if not legal_moves:
             return None
 
         prompt = self._build_prompt(fen)
 
-        best_score = -float("inf")
-        best_move = candidates[0]
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
 
-        for move in candidates:
-            try:
-                score = self._score_move(prompt, move.uci())
-                if score > best_score:
-                    best_score = score
-                    best_move = move
-            except Exception:
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+
+        # logits for next token only
+        logits = outputs.logits[:, -1, :]
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+        best_score = -float("inf")
+        best_move = legal_moves[0]
+
+        for move in legal_moves:
+            uci = move.uci()
+
+            # take first token of move
+            tokens = self.tokenizer(uci, add_special_tokens=False)["input_ids"]
+
+            if not tokens:
                 continue
+
+            first_token = tokens[0]
+            score = log_probs[0, first_token].item()
+
+            if score > best_score:
+                best_score = score
+                best_move = move
 
         return best_move.uci()
