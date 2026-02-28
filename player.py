@@ -11,7 +11,7 @@ class TransformerPlayer(Player):
         self,
         name: str = "Student",
         model_id: str = "2pp/chess-transformer",
-        top_k: int = 5,   # second-stage refinement
+        top_k: int = 3,  # refinement depth
     ):
         super().__init__(name)
 
@@ -24,7 +24,7 @@ class TransformerPlayer(Player):
         self.loaded = False
 
     # -------------------------
-    # Safe lazy loading (offline capable)
+    # Safe lazy loading
     # -------------------------
     def _load_model(self):
         if self.loaded:
@@ -67,25 +67,27 @@ class TransformerPlayer(Player):
         try:
             self._load_model()
         except Exception:
-            return legal_moves[0].uci()  # deterministic safety
+            return legal_moves[0].uci()
 
         prompt = f"FEN: {fen}\nMove:"
-        base_inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
 
         with torch.no_grad():
 
-            # Forward once for prompt
-            base_outputs = self.model(**base_inputs, use_cache=True)
+            base_outputs = self.model(**inputs, use_cache=True)
             base_logits = base_outputs.logits[:, -1, :]
             base_past = base_outputs.past_key_values
 
-            # -----------------------------------
-            # Stage 1: Single-token scoring
-            # -----------------------------------
-            single_scores = []
+            log_probs = torch.log_softmax(base_logits, dim=-1)
+
+            # -------------------------
+            # Stage 1: Fast ranking
+            # -------------------------
+            scored_moves = []
 
             for move in legal_moves:
                 uci = move.uci()
+
                 tokens = self.tokenizer(
                     " " + uci,
                     add_special_tokens=False
@@ -95,23 +97,19 @@ class TransformerPlayer(Player):
                     continue
 
                 first_token = tokens[0]
-                log_probs = torch.log_softmax(base_logits, dim=-1)
                 score = log_probs[0, first_token].item()
+                scored_moves.append((uci, score))
 
-                single_scores.append((uci, score))
-
-            if not single_scores:
+            if not scored_moves:
                 return legal_moves[0].uci()
 
-            # Sort descending
-            single_scores.sort(key=lambda x: x[1], reverse=True)
+            scored_moves.sort(key=lambda x: x[1], reverse=True)
 
-            # Keep top-k for full scoring
-            candidates = single_scores[:min(self.top_k, len(single_scores))]
+            candidates = scored_moves[:min(self.top_k, len(scored_moves))]
 
-            # -----------------------------------
-            # Stage 2: Full multi-token scoring
-            # -----------------------------------
+            # -------------------------
+            # Stage 2: Full scoring
+            # -------------------------
             best_move = None
             best_score = float("-inf")
 
@@ -127,7 +125,6 @@ class TransformerPlayer(Player):
                 logits = base_logits
 
                 for token in tokens:
-
                     log_probs = torch.log_softmax(logits, dim=-1)
                     total_logprob += log_probs[0, token].item()
 
@@ -146,7 +143,4 @@ class TransformerPlayer(Player):
                     best_score = total_logprob
                     best_move = uci
 
-        if best_move is not None:
-            return best_move
-
-        return legal_moves[0].uci()
+        return best_move if best_move else legal_moves[0].uci()
