@@ -2,136 +2,126 @@ import chess
 import torch
 from typing import Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
 from chess_tournament.players import Player
 
 
 class TransformerPlayer(Player):
+    """
+    Deterministic transformer-based chess player.
+    Uses legal-move log-probability ranking.
+    """
 
     def __init__(
         self,
         name: str = "Student",
-        model_id: str = "2pp/chess-transformer",
-        top_k: int = 3,
+        model_id: str = "distilgpt2",
     ):
         super().__init__(name)
 
         self.model_id = model_id
-        self.top_k = top_k
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.tokenizer = None
         self.model = None
-        self.loaded = False
+
+        torch.set_num_threads(2)
 
     # -------------------------
-    # Lazy model loading
+    # Lazy loading
     # -------------------------
     def _load_model(self):
-        if self.loaded:
-            return
-
-        # First try normal loading (allows download)
-        try:
+        if self.model is None:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
             self.model = AutoModelForCausalLM.from_pretrained(self.model_id)
-        except Exception as e:
-            raise RuntimeError(f"Model loading failed: {e}")
+            self.model.to(self.device)
+            self.model.eval()
 
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+    # -------------------------
+    # Prompt
+    # -------------------------
+    def _build_prompt(self, fen: str) -> str:
+        return f"Position: {fen}\nBest move:"
 
-        self.model.to(self.device)
-        self.model.eval()
-        self.loaded = True
+    # -------------------------
+    # Log-prob scoring
+    # -------------------------
+    def _score_move(self, prompt: str, move_uci: str) -> float:
+        full_text = prompt + move_uci
+
+        inputs = self.tokenizer(full_text, return_tensors="pt").to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+
+        logits = outputs.logits
+        shift_logits = logits[:, :-1, :]
+        shift_labels = inputs["input_ids"][:, 1:]
+
+        log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+
+        move_tokens = self.tokenizer(move_uci, return_tensors="pt")["input_ids"][0]
+        move_len = move_tokens.size(0)
+
+        total_log_prob = 0.0
+
+        for i in range(move_len):
+            token_id = shift_labels[0, -move_len + i]
+            total_log_prob += log_probs[0, -move_len + i, token_id].item()
+
+        return total_log_prob
+
+    # -------------------------
+    # Candidate filtering
+    # -------------------------
+    def _select_candidates(self, board: chess.Board):
+        legal_moves = list(board.legal_moves)
+
+        captures = [m for m in legal_moves if board.is_capture(m)]
+        checks = [m for m in legal_moves if board.gives_check(m)]
+
+        candidates = captures + checks
+
+        if len(candidates) < 8:
+            others = [m for m in legal_moves if m not in candidates]
+            candidates += others[: 8 - len(candidates)]
+
+        if not candidates:
+            candidates = legal_moves
+
+        return candidates
 
     # -------------------------
     # Main API
     # -------------------------
     def get_move(self, fen: str) -> Optional[str]:
-
-        board = chess.Board(fen)
-        legal_moves = list(board.legal_moves)
-
-        if not legal_moves:
-            return None
-
         try:
             self._load_model()
         except Exception:
-            # deterministic safe fallback
-            return legal_moves[0].uci()
+            return None
 
-        prompt = f"FEN: {fen}\nMove:"
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        board = chess.Board(fen)
+        candidates = self._select_candidates(board)
 
-        with torch.no_grad():
+        if not candidates:
+            return None
 
-            base_outputs = self.model(**inputs, use_cache=True)
-            base_logits = base_outputs.logits[:, -1, :]
-            base_past = base_outputs.past_key_values
+        prompt = self._build_prompt(fen)
 
-            log_probs = torch.log_softmax(base_logits, dim=-1)
+        best_score = -float("inf")
+        best_move = candidates[0]
 
-            # -------------------------
-            # Stage 1: single-token ranking
-            # -------------------------
-            scored_moves = []
+        for move in candidates:
+            try:
+                score = self._score_move(prompt, move.uci())
+                if score > best_score:
+                    best_score = score
+                    best_move = move
+            except Exception:
+                continue
 
-            for move in legal_moves:
-                uci = move.uci()
-
-                tokens = self.tokenizer(
-                    " " + uci,
-                    add_special_tokens=False
-                )["input_ids"]
-
-                if not tokens:
-                    continue
-
-                first_token = tokens[0]
-                score = log_probs[0, first_token].item()
-                scored_moves.append((uci, score))
-
-            if not scored_moves:
-                return legal_moves[0].uci()
-
-            scored_moves.sort(key=lambda x: x[1], reverse=True)
-            candidates = scored_moves[:min(self.top_k, len(scored_moves))]
-
-            # -------------------------
-            # Stage 2: multi-token refinement
-            # -------------------------
-            best_move = None
-            best_score = float("-inf")
-
-            for uci, _ in candidates:
-
-                tokens = self.tokenizer(
-                    " " + uci,
-                    add_special_tokens=False
-                )["input_ids"]
-
-                total_logprob = 0.0
-                past = base_past
-                logits = base_logits
-
-                for token in tokens:
-                    log_probs = torch.log_softmax(logits, dim=-1)
-                    total_logprob += log_probs[0, token].item()
-
-                    token_tensor = torch.tensor([[token]], device=self.device)
-
-                    outputs = self.model(
-                        input_ids=token_tensor,
-                        past_key_values=past,
-                        use_cache=True
-                    )
-
-                    logits = outputs.logits[:, -1, :]
-                    past = outputs.past_key_values
-
-                if total_logprob > best_score:
-                    best_score = total_logprob
-                    best_move = uci
-
-        return best_move if best_move else legal_moves[0].uci()
+        return best_move.uci()
