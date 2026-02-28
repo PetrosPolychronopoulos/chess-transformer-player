@@ -11,7 +11,7 @@ class TransformerPlayer(Player):
         self,
         name: str = "Student",
         model_id: str = "2pp/chess-transformer",
-        top_k: int = 3,  # refinement depth
+        top_k: int = 3,
     ):
         super().__init__(name)
 
@@ -24,30 +24,21 @@ class TransformerPlayer(Player):
         self.loaded = False
 
     # -------------------------
-    # Safe lazy loading
+    # Lazy model loading
     # -------------------------
     def _load_model(self):
         if self.loaded:
             return
 
+        # First try normal loading (allows download)
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_id,
-                local_files_only=True
-            )
-        except Exception:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+            self.model = AutoModelForCausalLM.from_pretrained(self.model_id)
+        except Exception as e:
+            raise RuntimeError(f"Model loading failed: {e}")
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_id,
-                local_files_only=True
-            )
-        except Exception:
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_id)
 
         self.model.to(self.device)
         self.model.eval()
@@ -67,6 +58,7 @@ class TransformerPlayer(Player):
         try:
             self._load_model()
         except Exception:
+            # deterministic safe fallback
             return legal_moves[0].uci()
 
         prompt = f"FEN: {fen}\nMove:"
@@ -81,7 +73,7 @@ class TransformerPlayer(Player):
             log_probs = torch.log_softmax(base_logits, dim=-1)
 
             # -------------------------
-            # Stage 1: Fast ranking
+            # Stage 1: single-token ranking
             # -------------------------
             scored_moves = []
 
@@ -104,11 +96,10 @@ class TransformerPlayer(Player):
                 return legal_moves[0].uci()
 
             scored_moves.sort(key=lambda x: x[1], reverse=True)
-
             candidates = scored_moves[:min(self.top_k, len(scored_moves))]
 
             # -------------------------
-            # Stage 2: Full scoring
+            # Stage 2: multi-token refinement
             # -------------------------
             best_move = None
             best_score = float("-inf")
