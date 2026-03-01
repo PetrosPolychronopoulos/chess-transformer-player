@@ -81,11 +81,11 @@ class TransformerPlayer(Player):
 
         self.move_counter += 1
 
-        # 1️⃣ Only move
+        # Only move
         if len(legal_moves) == 1:
             return legal_moves[0].uci()
 
-        # 2️⃣ Mate in 1
+        # Mate in 1
         for move in legal_moves:
             board.push(move)
             if board.is_checkmate():
@@ -93,7 +93,7 @@ class TransformerPlayer(Player):
                 return move.uci()
             board.pop()
 
-        # 3️⃣ Material gain
+        # Material gain
         current_material = self._material_score(board)
         scored = []
 
@@ -109,11 +109,11 @@ class TransformerPlayer(Player):
         if best_gain > 0:
             return random.choice(best_moves).uci()
 
-        # 4️⃣ LM only every 4 moves
+        # LM only every 4 moves
         if self.move_counter % 4 != 0:
             return random.choice(best_moves).uci()
 
-        # 5️⃣ LM call
+        # LM call
         try:
             prompt = self._build_prompt(fen)
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
