@@ -1,6 +1,7 @@
 import chess
-import torch
+import random
 import re
+import torch
 from typing import Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -9,25 +10,33 @@ from chess_tournament.players import Player
 
 class TransformerPlayer(Player):
 
-    UCI_REGEX = re.compile(r"\b[a-h][1-8][a-h][1-8][qrbn]?\b")
+    UCI_REGEX = re.compile(r"\b([a-h][1-8][a-h][1-8][qrbn]?)\b", re.IGNORECASE)
 
     def __init__(
         self,
-        name: str = "Student",
+        name: str = "ChessTransformer",
         model_id: str = "2pp/chess-smollm-1000steps",
+        max_new_tokens: int = 6,
     ):
         super().__init__(name)
 
         self.model_id = model_id
+        self.max_new_tokens = max_new_tokens
+
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        # Load ONCE
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.model = AutoModelForCausalLM.from_pretrained(self.model_id)
         self.model.to(self.device)
         self.model.eval()
+
+        # Avoid generation warning
+        self.model.config.pad_token_id = self.tokenizer.eos_token_id
 
     # -------------------------
     # Prompt
@@ -36,40 +45,18 @@ class TransformerPlayer(Player):
         return f"FEN: {fen}\nMove:"
 
     # -------------------------
-    # Extract UCI
+    # Extract UCI move
     # -------------------------
-    def _extract_uci(self, text: str) -> Optional[str]:
+    def _extract_move(self, text: str) -> Optional[str]:
         match = self.UCI_REGEX.search(text)
-        return match.group(0) if match else None
+        return match.group(1).lower() if match else None
 
     # -------------------------
-    # Material fallback
+    # Fallback (always legal)
     # -------------------------
-    def _material_fallback(self, board: chess.Board) -> str:
-        piece_values = {
-            chess.PAWN: 1,
-            chess.KNIGHT: 3,
-            chess.BISHOP: 3,
-            chess.ROOK: 5,
-            chess.QUEEN: 9,
-        }
-
-        best_move = None
-        best_score = -float("inf")
-
-        for move in board.legal_moves:
-            board.push(move)
-            score = 0
-            for piece_type, value in piece_values.items():
-                score += len(board.pieces(piece_type, board.turn)) * value
-                score -= len(board.pieces(piece_type, not board.turn)) * value
-            board.pop()
-
-            if score > best_score:
-                best_score = score
-                best_move = move
-
-        return best_move.uci()
+    def _random_legal(self, board: chess.Board) -> Optional[str]:
+        moves = list(board.legal_moves)
+        return random.choice(moves).uci() if moves else None
 
     # -------------------------
     # Main API
@@ -83,33 +70,40 @@ class TransformerPlayer(Player):
 
         prompt = self._build_prompt(fen)
 
-        inputs = self.tokenizer(
-            prompt,
-            return_tensors="pt"
-        ).to(self.device)
+        try:
+            inputs = self.tokenizer(
+                prompt,
+                return_tensors="pt"
+            ).to(self.device)
 
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=6,
-                do_sample=False
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=False,  # deterministic & fast
+                )
+
+            decoded = self.tokenizer.decode(
+                outputs[0],
+                skip_special_tokens=True
             )
 
-        generated_text = self.tokenizer.decode(
-            outputs[0],
-            skip_special_tokens=True
-        )
+            # Remove prompt part
+            if decoded.startswith(prompt):
+                decoded = decoded[len(prompt):]
 
-        move_uci = self._extract_uci(generated_text)
+            move = self._extract_move(decoded)
 
-        # If LM move is legal → play it
-        if move_uci:
-            try:
-                move = chess.Move.from_uci(move_uci)
-                if move in board.legal_moves:
-                    return move_uci
-            except:
-                pass
+            if move:
+                try:
+                    chess_move = chess.Move.from_uci(move)
+                    if chess_move in board.legal_moves:
+                        return move
+                except:
+                    pass
 
-        # Fallback → material best move
-        return self._material_fallback(board)
+        except Exception:
+            pass
+
+        # Fallback
+        return self._random_legal(board)
